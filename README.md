@@ -4,7 +4,7 @@
 
 This repository contains the source code for the paper "MERIT: Efficient In-Place Deletion for Dynamic Graph-Based Approximate Nearest Neighbor Indexes". In the paper, we propose a novel deletion repair algorithm. Merit is designed to efficiently handle deletions in graph-based ANNS and ensure that the graph remains connected and maintains high search performance after deletions.
 
-This repository is based on Ant Group VSAG repository. It contains the Merit deletion repair implementation for VSAG HGraph (an HNSW graph variant) in both the single-ID and batched APIs:
+This repository is based on Ant Group VSAG repository (https://github.com/antgroup/vsag, Commit ID: 6cf34b908dc72859c1a111fefe831d58dd704240). It contains the Merit deletion repair implementation for VSAG HGraph (an HNSW graph variant) in both the single-ID and batched APIs:
 
 ```cpp
 bool HGraph::Remove(int64_t id);
