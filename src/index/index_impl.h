@@ -100,6 +100,15 @@ public:
     }
 
     tl::expected<bool, Error>
+    Remove(const std::vector<int64_t>& ids) override {
+        if (this->inner_index_->immutable_) {
+            return tl::unexpected(
+                Error(ErrorType::UNSUPPORTED_INDEX_OPERATION, "immutable index no support remove"));
+        }
+        SAFE_CALL(return this->inner_index_->Remove(ids));
+    }
+
+    tl::expected<bool, Error>
     UpdateId(int64_t old_id, int64_t new_id) override {
         if (this->inner_index_->immutable_) {
             return tl::unexpected(Error(ErrorType::UNSUPPORTED_INDEX_OPERATION,

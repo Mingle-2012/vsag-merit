@@ -60,6 +60,7 @@ public:
     bool use_attribute_filter{false};
     uint64_t ef_construction{400};
     uint64_t build_thread_count{100};
+    uint64_t remove_repair_k{3};
 
     bool support_duplicate{false};
 

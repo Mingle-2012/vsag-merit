@@ -178,6 +178,11 @@ public:
     }
 
     virtual bool
+    Remove(const std::vector<int64_t>& ids) {
+        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION, "Index doesn't support Remove");
+    }
+
+    virtual bool
     UpdateId(int64_t old_id, int64_t new_id) {
         throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
                             "Index doesn't support UpdateId");

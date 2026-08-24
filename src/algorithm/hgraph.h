@@ -15,7 +15,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <nlohmann/json.hpp>
+#include <memory>
 #include <random>
 #include <shared_mutex>
 #include <string>
@@ -89,6 +91,9 @@ public:
 
     bool
     Remove(int64_t id) override;
+
+    bool
+    Remove(const std::vector<int64_t>& ids) override;
 
     [[nodiscard]] DatasetPtr
     KnnSearch(const DatasetPtr& query,
@@ -343,6 +348,7 @@ private:
 
     std::shared_ptr<SafeThreadPool> build_pool_{nullptr};
     uint64_t build_thread_count_{100};
+    uint64_t remove_repair_k_{2};
 
     std::atomic<InnerIdType> max_capacity_{0};
 
@@ -356,6 +362,9 @@ private:
 
     UnorderedSet<InnerIdType> deleted_ids_;
     std::atomic<int64_t> delete_count_{0};
+
+    std::unique_ptr<std::atomic<uint8_t>[]> is_deleted_bitmap_;
+    std::atomic<size_t> is_deleted_bitmap_capacity_{0};
 
     std::shared_ptr<Optimizer<BasicSearcher>> optimizer_;
 

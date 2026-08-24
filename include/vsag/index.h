@@ -117,6 +117,17 @@ public:
     }
 
     /**
+      * @brief Remove the vectors corresponding to the given IDs from the index
+      *
+      * @param ids IDs of the vectors that need to be removed
+      * @return result indicates whether all remove operations are successful
+      */
+    virtual tl::expected<bool, Error>
+    Remove(const std::vector<int64_t>& ids) {
+        throw std::runtime_error("Index not support delete vector");
+    }
+
+    /**
      * @brief Update the id of a base point from the index
      *
      * @param old_id indicates the old id of a base point in index

@@ -18,7 +18,11 @@
 #include <data_cell/compressed_graph_datacell_parameter.h>
 #include <fmt/format.h>
 
+#include <future>
+#include <limits>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <stdexcept>
 
 #include "attr/argparse.h"
@@ -50,6 +54,7 @@ HGraph::HGraph(const HGraphParameterPtr& hgraph_param, const vsag::IndexCommonPa
       use_attribute_filter_(hgraph_param->use_attribute_filter),
       ef_construct_(hgraph_param->ef_construction),
       build_thread_count_(hgraph_param->build_thread_count),
+      remove_repair_k_(hgraph_param->remove_repair_k),
       odescent_param_(hgraph_param->odescent_param),
       graph_type_(hgraph_param->graph_type),
       hierarchical_datacell_param_(hgraph_param->hierarchical_graph_param),
@@ -64,6 +69,8 @@ HGraph::HGraph(const HGraphParameterPtr& hgraph_param, const vsag::IndexCommonPa
             FlattenInterface::MakeInstance(hgraph_param->precise_codes_param, common_param);
     }
     this->searcher_ = std::make_shared<BasicSearcher>(common_param, neighbors_mutex_);
+    this->is_deleted_bitmap_ = std::make_unique<std::atomic<uint8_t>[]>(0);
+    this->is_deleted_bitmap_capacity_.store(0);
 
     this->bottom_graph_ =
         GraphInterface::MakeInstance(hgraph_param->bottom_graph_param, common_param);
@@ -1052,7 +1059,6 @@ HGraph::resize(uint64_t new_size) {
         pool_ = std::make_shared<VisitedListPool>(1, allocator_, new_size_power_2, allocator_);
         this->label_table_->Resize(new_size_power_2);
         bottom_graph_->Resize(new_size_power_2);
-        this->max_capacity_.store(new_size_power_2);
         this->basic_flatten_codes_->Resize(new_size_power_2);
         if (use_reorder_) {
             this->high_precise_codes_->Resize(new_size_power_2);
@@ -1060,6 +1066,19 @@ HGraph::resize(uint64_t new_size) {
         if (this->extra_infos_ != nullptr) {
             this->extra_infos_->Resize(new_size_power_2);
         }
+        auto old_bitmap_cap = this->is_deleted_bitmap_capacity_.load();
+        if (new_size_power_2 > old_bitmap_cap) {
+            auto new_bitmap = std::make_unique<std::atomic<uint8_t>[]>(new_size_power_2);
+            for (size_t i = 0; i < new_size_power_2; ++i) {
+                new_bitmap[i].store((i < old_bitmap_cap) ? this->is_deleted_bitmap_[i].load(
+                                                               std::memory_order_relaxed)
+                                                         : 0,
+                                    std::memory_order_relaxed);
+            }
+            this->is_deleted_bitmap_ = std::move(new_bitmap);
+            this->is_deleted_bitmap_capacity_.store(new_size_power_2);
+        }
+        this->max_capacity_.store(new_size_power_2);
     }
 }
 void
@@ -1229,7 +1248,8 @@ static const std::string HGRAPH_PARAMS_TEMPLATE =
         },
         "{BUILD_PARAMS_KEY}": {
             "{BUILD_EF_CONSTRUCTION}": 400,
-            "{BUILD_THREAD_COUNT}": 100
+            "{BUILD_THREAD_COUNT}": 100,
+            "{BUILD_REMOVE_REPAIR_K}": 3
         },
         "{HGRAPH_EXTRA_INFO_KEY}": {
             "{IO_PARAMS_KEY}": {
@@ -1416,6 +1436,13 @@ HGraph::CheckAndMappingExternalParam(const JsonType& external_param,
                                                 },
                                             },
                                             {
+                                                HGRAPH_REMOVE_REPAIR_K,
+                                                {
+                                                    BUILD_PARAMS_KEY,
+                                                    BUILD_REMOVE_REPAIR_K,
+                                                },
+                                            },
+                                            {
                                                 SQ4_UNIFORM_TRUNC_RATE,
                                                 {
                                                     HGRAPH_BASE_CODES_KEY,
@@ -1517,9 +1544,17 @@ HGraph::GetCodeByInnerId(InnerIdType inner_id, uint8_t* data) const {
 
 bool
 HGraph::Remove(int64_t id) {
-    // TODO(inbao): support thread safe remove
-    auto inner_id = this->label_table_->GetIdByLabel(id);
+    InnerIdType inner_id;
+    {
+        std::shared_lock<std::shared_mutex> lock(this->label_lookup_mutex_);
+        if (!this->label_table_->CheckLabel(id)) {
+            return false;
+        }
+        inner_id = this->label_table_->GetIdByLabel(id);
+    }
+
     if (inner_id == this->entry_point_id_) {
+        std::scoped_lock wlock(this->global_mutex_);
         bool find_new_ep = false;
         while (not route_graphs_.empty()) {
             auto& upper_graph = route_graphs_.back();
@@ -1539,14 +1574,363 @@ HGraph::Remove(int64_t id) {
             route_graphs_.pop_back();
         }
     }
-    for (int level = static_cast<int>(route_graphs_.size()) - 1; level >= 0; --level) {
-        this->route_graphs_[level]->DeleteNeighborsById(inner_id);
+
+    this->is_deleted_bitmap_[inner_id].store(1, std::memory_order_release);
+
+    DistHeapPtr result = nullptr;
+    InnerSearchParam param{
+        .topk = 1,
+        .ep = this->entry_point_id_,
+        .ef = 1,
+        .is_inner_id_allowed = nullptr,
+    };
+
+    auto max_level = static_cast<int>(route_graphs_.size()) - 1;
+
+    auto flatten_codes = basic_flatten_codes_;
+    if (use_reorder_ and not build_by_base_) {
+        flatten_codes = high_precise_codes_;
     }
+
+    auto& deleted_bitmap = this->is_deleted_bitmap_;
+    auto is_node_deleted = [&deleted_bitmap](InnerIdType nid) -> bool {
+        return deleted_bitmap[nid].load(std::memory_order_acquire) != 0;
+    };
+
+    auto insert_edge_with_prune =
+        [&](const GraphInterfacePtr& graph, InnerIdType src, InnerIdType dst, size_t max_degree) {
+            if (src == dst || is_node_deleted(src) || is_node_deleted(dst)) {
+                return;
+            }
+
+            LockGuard lock(neighbors_mutex_, src);
+            Vector<InnerIdType> src_neighbors(allocator_);
+            graph->GetNeighbors(src, src_neighbors);
+
+            Vector<InnerIdType> filtered_neighbors(allocator_);
+            filtered_neighbors.reserve(src_neighbors.size());
+            for (const auto& nb : src_neighbors) {
+                if (is_node_deleted(nb)) {
+                    continue;
+                }
+                if (nb == dst) {
+                    return;
+                }
+                filtered_neighbors.emplace_back(nb);
+            }
+
+            if (filtered_neighbors.size() < max_degree) {
+                filtered_neighbors.emplace_back(dst);
+                graph->InsertNeighborsById(src, filtered_neighbors);
+                return;
+            }
+
+            auto candidates = std::make_shared<StandardHeap<true, false>>(allocator_, -1);
+            candidates->Push(flatten_codes->ComputePairVectors(dst, src), dst);
+            for (const auto& nb : filtered_neighbors) {
+                candidates->Push(flatten_codes->ComputePairVectors(nb, src), nb);
+            }
+            select_edges_by_heuristic(candidates, max_degree, flatten_codes, allocator_);
+
+            Vector<InnerIdType> new_neighbors(allocator_);
+            while (!candidates->Empty()) {
+                new_neighbors.emplace_back(candidates->Top().second);
+                candidates->Pop();
+            }
+            graph->InsertNeighborsById(src, new_neighbors);
+        };
+    const size_t repair_k = std::max<size_t>(1, static_cast<size_t>(this->remove_repair_k_));
+    auto collect_k_connected = [&](InnerIdType target,
+                                   const UnorderedSet<InnerIdType>& connected,
+                                   Vector<InnerIdType>& selected) {
+        selected.clear();
+        using DistId = std::pair<float, InnerIdType>;
+        std::priority_queue<DistId> heap;
+        for (const auto& connected_id : connected) {
+            float dist = flatten_codes->ComputePairVectors(target, connected_id);
+            if (heap.size() < repair_k) {
+                heap.emplace(dist, connected_id);
+            } else if (dist < heap.top().first) {
+                heap.pop();
+                heap.emplace(dist, connected_id);
+            }
+        }
+        selected.resize(heap.size());
+        for (auto i = static_cast<int64_t>(heap.size()) - 1; i >= 0; --i) {
+            selected[i] = heap.top().second;
+            heap.pop();
+        }
+    };
+
+    auto build_mst_repair = [&](const GraphInterfacePtr& graph,
+                                const UnorderedSet<InnerIdType>& to_be_repaired,
+                                InnerIdType starter,
+                                size_t max_degree) {
+        UnorderedSet<InnerIdType> connected(allocator_);
+        connected.insert(starter);
+
+        using DistPair = std::pair<float, InnerIdType>;
+        auto cmp = [](const DistPair& a, const DistPair& b) { return a.first > b.first; };
+        std::priority_queue<DistPair, std::vector<DistPair>, decltype(cmp)> pq(cmp);
+
+        for (const auto& node_id : to_be_repaired) {
+            if (node_id == starter) {
+                continue;
+            }
+            float dist = flatten_codes->ComputePairVectors(node_id, starter);
+            pq.push({dist, node_id});
+        }
+
+        while (!pq.empty() && static_cast<int64_t>(connected.size()) <
+                                  static_cast<int64_t>(to_be_repaired.size())) {
+            auto [dist, node_id] = pq.top();
+            pq.pop();
+
+            if (connected.find(node_id) != connected.end()) {
+                continue;
+            }
+
+            Vector<InnerIdType> nearest_connected(allocator_);
+            collect_k_connected(node_id, connected, nearest_connected);
+            for (const auto& connected_id : nearest_connected) {
+                insert_edge_with_prune(graph, node_id, connected_id, max_degree);
+                insert_edge_with_prune(graph, connected_id, node_id, max_degree);
+            }
+
+            connected.insert(node_id);
+
+            for (const auto& uncon_id : to_be_repaired) {
+                if (connected.find(uncon_id) != connected.end()) {
+                    continue;
+                }
+                float new_dist = flatten_codes->ComputePairVectors(uncon_id, node_id);
+                pq.push({new_dist, uncon_id});
+            }
+        }
+    };
+
+    Vector<float> delete_point_data(dim_, 0.0F, allocator_);
+    int level = -1;
+
+    // Per-level neighbor snapshots for route graphs
+    Vector<Vector<InnerIdType>> route_neighbor_snapshots(allocator_);
+    route_neighbor_snapshots.resize(max_level + 1, Vector<InnerIdType>(allocator_));
+    Vector<InnerIdType> bottom_neighbor_snapshot(allocator_);
+
+    // ===== Phase 2: snapshot data and neighbors (hold inner_id lock briefly) =====
+    {
+        LockGuard lock(neighbors_mutex_, inner_id);
+        GetVectorByInnerId(inner_id, delete_point_data.data());
+
+        for (int j = max_level; j >= 0; --j) {
+            if (route_graphs_[j]->GetNeighborSize(inner_id) != 0) {
+                level = j;
+                break;
+            }
+            result =
+                search_one_graph(delete_point_data.data(), route_graphs_[j], flatten_codes, param);
+            param.ep = result->Top().second;
+        }
+
+        for (int l = level; l >= 0; --l) {
+            route_graphs_[l]->GetNeighbors(inner_id, route_neighbor_snapshots[l]);
+        }
+        bottom_graph_->GetNeighbors(inner_id, bottom_neighbor_snapshot);
+    }
+    // inner_id lock released here — edges still active so repair search works correctly
+
+    // ===== Phase 2: search and repair neighbors (no inner_id lock held) =====
+    param.ef = this->ef_construct_;
+    param.topk = static_cast<int64_t>(ef_construct_);
+
+    if (level != -1) {
+        // if level is not -1, then this is a routing point
+        for (int l = level; l >= 0; --l) {
+            if (route_graphs_[l]->TotalCount() == 0) {
+                continue;
+            }
+            auto& neighbors = route_neighbor_snapshots[l];
+            if (neighbors.empty()) {
+                continue;
+            }
+            const size_t max_degree = route_graphs_[l]->MaximumDegree();
+            param.ef = max_degree * 2;
+            param.topk = static_cast<int64_t>(max_degree * 2);
+
+            const size_t repair_cap = max_degree * 2;
+            using RepairDistId = std::pair<float, InnerIdType>;
+            std::priority_queue<RepairDistId> repair_heap;
+            UnorderedSet<InnerIdType> seen(allocator_);
+
+            auto try_insert = [&](InnerIdType nid) {
+                if (nid == inner_id || is_node_deleted(nid))
+                    return;
+                if (seen.find(nid) != seen.end())
+                    return;
+                seen.insert(nid);
+                float d = flatten_codes->ComputePairVectors(nid, inner_id);
+                if (repair_heap.size() < repair_cap) {
+                    repair_heap.emplace(d, nid);
+                } else if (d < repair_heap.top().first) {
+                    repair_heap.pop();
+                    repair_heap.emplace(d, nid);
+                }
+            };
+
+            for (const auto& nb : neighbors) {
+                try_insert(nb);
+            }
+            for (const auto& nb : neighbors) {
+                Vector<InnerIdType> tmp_neighbors(allocator_);
+                route_graphs_[l]->GetNeighbors(nb, tmp_neighbors);
+                for (auto&& nb_id : tmp_neighbors) {
+                    try_insert(nb_id);
+                }
+            }
+
+            result =
+                search_one_graph(delete_point_data.data(), route_graphs_[l], flatten_codes, param);
+            auto result_data = result->GetData();
+            for (int64_t i = 0; i < result->Size(); ++i) {
+                Vector<InnerIdType> tmp_neighbors(allocator_);
+                route_graphs_[l]->GetNeighbors(result_data[i].second, tmp_neighbors);
+                for (auto&& nb_id : tmp_neighbors) {
+                    if (nb_id == inner_id) {
+                        try_insert(result_data[i].second);
+                        break;
+                    }
+                }
+            }
+
+            UnorderedSet<InnerIdType> to_be_repaired(allocator_);
+            while (!repair_heap.empty()) {
+                to_be_repaired.insert(repair_heap.top().second);
+                repair_heap.pop();
+            }
+
+            if (!to_be_repaired.empty()) {
+                InnerIdType starter = *to_be_repaired.begin();
+                float min_dist = flatten_codes->ComputePairVectors(starter, entry_point_id_);
+                for (const auto& nid : to_be_repaired) {
+                    float d = flatten_codes->ComputePairVectors(nid, entry_point_id_);
+                    if (d < min_dist) {
+                        min_dist = d;
+                        starter = nid;
+                    }
+                }
+                build_mst_repair(route_graphs_[l], to_be_repaired, starter, max_degree);
+            }
+        }
+    }
+
+    if (bottom_graph_->TotalCount() != 0 && !bottom_neighbor_snapshot.empty()) {
+        const size_t max_degree = bottom_graph_->MaximumDegree();
+        param.ef = max_degree * 2;
+        param.topk = static_cast<int64_t>(max_degree * 2);
+        const size_t repair_cap_bottom = max_degree * 2;
+        using RepairDistIdBottom = std::pair<float, InnerIdType>;
+        std::priority_queue<RepairDistIdBottom> repair_heap_bottom;
+        UnorderedSet<InnerIdType> seen_bottom(allocator_);
+
+        auto try_insert_bottom = [&](InnerIdType nid) {
+            if (nid == inner_id || is_node_deleted(nid))
+                return;
+            if (seen_bottom.find(nid) != seen_bottom.end())
+                return;
+            seen_bottom.insert(nid);
+            float d = flatten_codes->ComputePairVectors(nid, inner_id);
+            if (repair_heap_bottom.size() < repair_cap_bottom) {
+                repair_heap_bottom.emplace(d, nid);
+            } else if (d < repair_heap_bottom.top().first) {
+                repair_heap_bottom.pop();
+                repair_heap_bottom.emplace(d, nid);
+            }
+        };
+
+        for (const auto& nb : bottom_neighbor_snapshot) {
+            try_insert_bottom(nb);
+        }
+        if (level != -1) {
+            for (const auto& nb : bottom_neighbor_snapshot) {
+                Vector<InnerIdType> tmp_neighbors(allocator_);
+                bottom_graph_->GetNeighbors(nb, tmp_neighbors);
+                for (auto&& nb_id : tmp_neighbors) {
+                    try_insert_bottom(nb_id);
+                }
+            }
+        }
+
+        result = search_one_graph(delete_point_data.data(), bottom_graph_, flatten_codes, param);
+        auto result_data = result->GetData();
+        for (int64_t i = 0; i < result->Size(); ++i) {
+            Vector<InnerIdType> tmp_neighbors(allocator_);
+            bottom_graph_->GetNeighbors(result_data[i].second, tmp_neighbors);
+            for (auto&& nb_id : tmp_neighbors) {
+                if (nb_id == inner_id) {
+                    try_insert_bottom(result_data[i].second);
+                    break;
+                }
+            }
+        }
+
+        UnorderedSet<InnerIdType> to_be_repaired(allocator_);
+        while (!repair_heap_bottom.empty()) {
+            to_be_repaired.insert(repair_heap_bottom.top().second);
+            repair_heap_bottom.pop();
+        }
+
+        if (!to_be_repaired.empty()) {
+            InnerIdType starter = *to_be_repaired.begin();
+            float min_dist = flatten_codes->ComputePairVectors(starter, entry_point_id_);
+            for (const auto& nid : to_be_repaired) {
+                float d = flatten_codes->ComputePairVectors(nid, entry_point_id_);
+                if (d < min_dist) {
+                    min_dist = d;
+                    starter = nid;
+                }
+            }
+            build_mst_repair(bottom_graph_, to_be_repaired, starter, max_degree);
+        }
+    }
+
     this->bottom_graph_->DeleteNeighborsById(inner_id);
     this->label_table_->Remove(id);
-    this->deleted_ids_.insert(inner_id);
-    delete_count_++;
+
     return true;
+}
+
+bool
+HGraph::Remove(const std::vector<int64_t>& ids) {
+    if (ids.empty()) {
+        return true;
+    }
+
+    auto remove_func = [this](int64_t id) -> bool { return this->Remove(id); };
+
+    bool all_success = true;
+    if (this->build_pool_ != nullptr) {
+        std::vector<std::future<bool>> futures;
+        futures.reserve(ids.size());
+        for (const auto id : ids) {
+            futures.emplace_back(this->build_pool_->GeneralEnqueue(remove_func, id));
+        }
+        for (auto& future : futures) {
+            try {
+                if (!future.get()) {
+                    all_success = false;
+                }
+            } catch (...) {
+                all_success = false;
+            }
+        }
+    } else {
+        for (const auto id : ids) {
+            if (!remove_func(id)) {
+                all_success = false;
+            }
+        }
+    }
+    return all_success;
 }
 
 void

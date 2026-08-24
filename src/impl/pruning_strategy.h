@@ -24,6 +24,12 @@
 
 namespace vsag {
 
+void
+select_edges_by_heuristic(const DistHeapPtr& edges,
+                          uint64_t max_size,
+                          const FlattenInterfacePtr& flatten,
+                          Allocator* allocator);
+
 InnerIdType
 mutually_connect_new_element(InnerIdType cur_c,
                              const DistHeapPtr& top_candidates,
