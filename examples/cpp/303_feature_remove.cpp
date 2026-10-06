@@ -148,7 +148,8 @@ main(int argc, char** argv) {
             }
         }
 
-        std::cout << "PASS: Merit HGraph Remove on Sift10k (1 scalar + " << batch_ids.size()
+        std::cout << "PASS: Merit HGraph Remove on " << num_vectors << " vectors (dim=" << dim
+                  << ", 1 scalar + " << batch_ids.size()
                   << " batched deletions)" << std::endl;
         return 0;
     } catch (const std::exception& error) {
