@@ -18,12 +18,15 @@
 #include <data_cell/compressed_graph_datacell_parameter.h>
 #include <fmt/format.h>
 
+#include <algorithm>
+#include <atomic>
 #include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "attr/argparse.h"
 #include "common.h"
@@ -1905,31 +1908,338 @@ HGraph::Remove(const std::vector<int64_t>& ids) {
         return true;
     }
 
-    auto remove_func = [this](int64_t id) -> bool { return this->Remove(id); };
-
+    // Batch Boundary Contraction (BBC): a delete batch usually contains many
+    // adjacent vertices.  Repairing each deleted vertex independently repeats
+    // graph search, MST construction, and pruning on the same surviving
+    // boundary.  BBC first invalidates the whole deleted set, contracts each
+    // deleted star into a sparse boundary graph, and rewrites every affected
+    // surviving adjacency list at most once.
+    std::vector<std::pair<int64_t, InnerIdType>> removed;
+    removed.reserve(ids.size());
+    std::unordered_set<InnerIdType> unique_inner_ids;
+    unique_inner_ids.reserve(ids.size());
     bool all_success = true;
-    if (this->build_pool_ != nullptr) {
-        std::vector<std::future<bool>> futures;
-        futures.reserve(ids.size());
-        for (const auto id : ids) {
-            futures.emplace_back(this->build_pool_->GeneralEnqueue(remove_func, id));
-        }
-        for (auto& future : futures) {
-            try {
-                if (!future.get()) {
-                    all_success = false;
-                }
-            } catch (...) {
+    {
+        std::shared_lock<std::shared_mutex> lock(this->label_lookup_mutex_);
+        for (const auto label : ids) {
+            if (!this->label_table_->CheckLabel(label)) {
                 all_success = false;
+                continue;
             }
-        }
-    } else {
-        for (const auto id : ids) {
-            if (!remove_func(id)) {
-                all_success = false;
+            const auto inner_id = this->label_table_->GetIdByLabel(label);
+            if (unique_inner_ids.insert(inner_id).second) {
+                removed.emplace_back(label, inner_id);
             }
         }
     }
+    if (removed.empty()) {
+        return all_success;
+    }
+
+    for (const auto& [label, inner_id] : removed) {
+        (void)label;
+        this->is_deleted_bitmap_[inner_id].store(1, std::memory_order_release);
+    }
+    auto is_deleted = [this](InnerIdType id) {
+        return this->is_deleted_bitmap_[id].load(std::memory_order_acquire) != 0;
+    };
+
+    // Move the entry point before version invalidation makes its incoming
+    // references disappear.  Prefer a surviving vertex at the highest layer.
+    if (is_deleted(this->entry_point_id_)) {
+        std::scoped_lock lock(this->global_mutex_);
+        bool found = false;
+        while (!route_graphs_.empty() && !found) {
+            Vector<InnerIdType> neighbors(allocator_);
+            route_graphs_.back()->GetNeighbors(this->entry_point_id_, neighbors);
+            for (const auto candidate : neighbors) {
+                if (!is_deleted(candidate)) {
+                    this->entry_point_id_ = candidate;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                route_graphs_.pop_back();
+            }
+        }
+        if (!found) {
+            for (InnerIdType candidate = 0;
+                 candidate < this->total_count_;
+                 ++candidate) {
+                if (!is_deleted(candidate)) {
+                    this->entry_point_id_ = candidate;
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    auto flatten_codes = basic_flatten_codes_;
+    if (use_reorder_ && !build_by_base_) {
+        flatten_codes = high_precise_codes_;
+    }
+    const size_t bridge_k =
+        std::max<size_t>(1, static_cast<size_t>(this->remove_repair_k_));
+
+    auto repair_one_graph = [&](const GraphInterfacePtr& graph) {
+        if (graph == nullptr || graph->TotalCount() == 0) {
+            return;
+        }
+
+        // Snapshot every deleted star while its version is still current.
+        // Each boundary receives an MST backbone plus k local geometric
+        // witnesses.  The MST preserves reachability; witnesses preserve the
+        // short angular alternatives that determine ANN recall.
+        // A batch contains thousands of independent deleted stars.  Construct
+        // their cached k-MSTs in parallel, then merge the immutable proposals.
+        // This changes neither the local k-MST rule nor its selected edges;
+        // it only removes a serial phase that made deletion incomparable with
+        // the already-parallel insertion path.
+        std::vector<std::vector<std::pair<InnerIdType, InnerIdType>>> local_bridges(
+            removed.size());
+        std::atomic<size_t> next_removed{0};
+        auto mst_worker = [&]() {
+            while (true) {
+                const size_t removed_index =
+                    next_removed.fetch_add(1, std::memory_order_relaxed);
+                if (removed_index >= removed.size()) {
+                    break;
+                }
+                const auto deleted_id = removed[removed_index].second;
+                auto& proposals = local_bridges[removed_index];
+            Vector<InnerIdType> raw_boundary(allocator_);
+            graph->GetNeighbors(deleted_id, raw_boundary);
+            std::vector<InnerIdType> boundary;
+            boundary.reserve(raw_boundary.size());
+            for (const auto candidate : raw_boundary) {
+                if (!is_deleted(candidate)) {
+                    boundary.push_back(candidate);
+                }
+            }
+            std::sort(boundary.begin(), boundary.end());
+            boundary.erase(std::unique(boundary.begin(), boundary.end()), boundary.end());
+            const size_t n = boundary.size();
+            if (n < 2) {
+                continue;
+            }
+            proposals.reserve((n - 1) * std::min(bridge_k, n - 1));
+
+            // Cached k-MST repair.  The former implementation repeatedly
+            // recomputed pair distances while Prim's connected set grew and
+            // then pruned after every inserted edge.  Materializing this tiny
+            // local matrix once preserves the same k-nearest-to-tree rule but
+            // reduces distance work from roughly O(k R^3) to O(R^2).
+            std::vector<float> cached_distances(n * n, 0.0F);
+            for (size_t i = 0; i < n; ++i) {
+                for (size_t j = i + 1; j < n; ++j) {
+                    const float distance =
+                        flatten_codes->ComputePairVectors(boundary[i], boundary[j]);
+                    cached_distances[i * n + j] = distance;
+                    cached_distances[j * n + i] = distance;
+                }
+            }
+            size_t root = 0;
+            float root_distance =
+                flatten_codes->ComputePairVectors(deleted_id, boundary.front());
+            for (size_t i = 1; i < n; ++i) {
+                const float distance =
+                    flatten_codes->ComputePairVectors(deleted_id, boundary[i]);
+                if (distance < root_distance) {
+                    root = i;
+                    root_distance = distance;
+                }
+            }
+
+            std::vector<uint8_t> connected(n, 0);
+            std::vector<float> best_to_tree(n, std::numeric_limits<float>::max());
+            connected[root] = 1;
+            for (size_t i = 0; i < n; ++i) {
+                if (i != root) {
+                    best_to_tree[i] = cached_distances[root * n + i];
+                }
+            }
+            const size_t local_k = std::min(bridge_k, n - 1);
+            for (size_t iteration = 1; iteration < n; ++iteration) {
+                size_t current = n;
+                for (size_t i = 0; i < n; ++i) {
+                    if (!connected[i] &&
+                        (current == n || best_to_tree[i] < best_to_tree[current])) {
+                        current = i;
+                    }
+                }
+                if (current == n) {
+                    break;
+                }
+
+                std::vector<size_t> nearest_connected;
+                nearest_connected.reserve(iteration);
+                for (size_t i = 0; i < n; ++i) {
+                    if (connected[i]) {
+                        nearest_connected.push_back(i);
+                    }
+                }
+                const size_t selected_count = std::min(local_k, nearest_connected.size());
+                std::partial_sort(nearest_connected.begin(),
+                                  nearest_connected.begin() +
+                                      static_cast<int64_t>(selected_count),
+                                  nearest_connected.end(),
+                                  [&](size_t lhs, size_t rhs) {
+                                      return cached_distances[current * n + lhs] <
+                                             cached_distances[current * n + rhs];
+                });
+                for (size_t i = 0; i < selected_count; ++i) {
+                    proposals.emplace_back(boundary[current],
+                                           boundary[nearest_connected[i]]);
+                }
+
+                connected[current] = 1;
+                for (size_t i = 0; i < n; ++i) {
+                    if (!connected[i]) {
+                        best_to_tree[i] = std::min(
+                            best_to_tree[i], cached_distances[current * n + i]);
+                    }
+                }
+            }
+            }
+        };
+        const size_t mst_worker_count = std::min<size_t>(
+            std::max<uint64_t>(1, this->build_thread_count_), removed.size());
+        if (this->build_pool_ != nullptr && mst_worker_count > 1) {
+            std::vector<std::future<void>> futures;
+            futures.reserve(mst_worker_count);
+            for (size_t i = 0; i < mst_worker_count; ++i) {
+                futures.emplace_back(this->build_pool_->GeneralEnqueue(mst_worker));
+            }
+            for (auto& future : futures) {
+                future.get();
+            }
+        } else {
+            mst_worker();
+        }
+        size_t proposal_count = 0;
+        for (const auto& proposals : local_bridges) {
+            proposal_count += proposals.size();
+        }
+        std::vector<std::pair<InnerIdType, InnerIdType>> directed_bridges;
+        directed_bridges.reserve(proposal_count * 2);
+        for (const auto& proposals : local_bridges) {
+            for (const auto& [lhs, rhs] : proposals) {
+                if (lhs != rhs && !is_deleted(lhs) && !is_deleted(rhs)) {
+                    directed_bridges.emplace_back(lhs, rhs);
+                    directed_bridges.emplace_back(rhs, lhs);
+                }
+            }
+        }
+        // Batch edge coalescing: k-MSTs of nearby deleted stars frequently
+        // propose the same repair edge.  Sorting the flat proposal stream once
+        // avoids millions of hash-table insertions and tiny vector allocations
+        // while producing exactly the same unique per-source candidate sets.
+        std::sort(directed_bridges.begin(), directed_bridges.end());
+        directed_bridges.erase(
+            std::unique(directed_bridges.begin(), directed_bridges.end()),
+            directed_bridges.end());
+
+        // Incrementing versions invalidates all incoming edges to the batch in
+        // O(|D|), so no global reverse-neighbor search is required.
+        for (const auto& [label, deleted_id] : removed) {
+            (void)label;
+            graph->DeleteNeighborsById(deleted_id);
+        }
+
+        const size_t max_degree = graph->MaximumDegree();
+        struct CandidateRange {
+            InnerIdType source;
+            size_t begin;
+            size_t end;
+        };
+        std::vector<CandidateRange> affected;
+        affected.reserve(directed_bridges.size());
+        for (size_t begin = 0; begin < directed_bridges.size();) {
+            size_t end = begin + 1;
+            while (end < directed_bridges.size() &&
+                   directed_bridges[end].first == directed_bridges[begin].first) {
+                ++end;
+            }
+            affected.push_back({directed_bridges[begin].first, begin, end});
+            begin = end;
+        }
+
+        std::atomic<size_t> next_affected{0};
+        auto repair_worker = [&]() {
+            while (true) {
+                const size_t index = next_affected.fetch_add(1, std::memory_order_relaxed);
+                if (index >= affected.size()) {
+                    break;
+                }
+                const auto& candidate_range = affected[index];
+                const auto source = candidate_range.source;
+                if (is_deleted(source)) {
+                    continue;
+                }
+                LockGuard lock(neighbors_mutex_, source);
+                Vector<InnerIdType> old_neighbors(allocator_);
+                graph->GetNeighbors(source, old_neighbors);
+                Vector<InnerIdType> new_neighbors(allocator_);
+                new_neighbors.reserve(max_degree);
+                std::unordered_set<InnerIdType> selected;
+                selected.reserve(max_degree * 2);
+                for (const auto candidate : old_neighbors) {
+                    if (candidate != source && !is_deleted(candidate) &&
+                        selected.insert(candidate).second) {
+                        new_neighbors.emplace_back(candidate);
+                    }
+                }
+                // Repair only the degree deficit created by this batch.  No
+                // pre-existing live edge is displaced and no robust-prune is
+                // needed, which bounds repair work by the actual damage.
+                for (size_t candidate_index = candidate_range.begin;
+                     candidate_index < candidate_range.end;
+                     ++candidate_index) {
+                    if (new_neighbors.size() >= max_degree) {
+                        break;
+                    }
+                    const auto candidate = directed_bridges[candidate_index].second;
+                    if (candidate != source && !is_deleted(candidate) &&
+                        selected.insert(candidate).second) {
+                        new_neighbors.emplace_back(candidate);
+                    }
+                }
+                graph->InsertNeighborsById(source, new_neighbors);
+            }
+        };
+
+        const size_t worker_count = std::min<size_t>(
+            std::max<uint64_t>(1, this->build_thread_count_), affected.size());
+        if (this->build_pool_ != nullptr && worker_count > 1) {
+            std::vector<std::future<void>> futures;
+            futures.reserve(worker_count);
+            for (size_t i = 0; i < worker_count; ++i) {
+                futures.emplace_back(this->build_pool_->GeneralEnqueue(repair_worker));
+            }
+            for (auto& future : futures) {
+                future.get();
+            }
+        } else {
+            repair_worker();
+        }
+    };
+
+    for (auto& route_graph : route_graphs_) {
+        repair_one_graph(route_graph);
+    }
+    repair_one_graph(bottom_graph_);
+
+    {
+        std::unique_lock<std::shared_mutex> lock(this->label_lookup_mutex_);
+        for (const auto& [label, inner_id] : removed) {
+            (void)inner_id;
+            this->label_table_->Remove(label);
+        }
+    }
+    this->delete_count_.fetch_add(static_cast<int64_t>(removed.size()),
+                                  std::memory_order_relaxed);
     return all_success;
 }
 
