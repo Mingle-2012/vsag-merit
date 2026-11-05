@@ -56,6 +56,8 @@ The example `303_feature_remove` expects `sift_base.fvecs` and `sift_query.fvecs
 
 ### Parameters
 
+Both Remove APIs use the same search-free repair path: propose bidirectional k_r-MST edges, merge them with surviving neighbors, and prune each affected adjacency list once using alpha=1.2.
+
 `remove_repair_k` controls how many already-connected vertices each new Merit repair vertex links to. The example uses `remove_repair_k: 3`.
 
 ## Citation

@@ -15,6 +15,7 @@
 
 #include "pruning_strategy.h"
 
+#include "algorithm/cleann_prune.h"
 #include "impl/heap/standard_heap.h"
 
 namespace vsag {
@@ -23,7 +24,22 @@ void
 select_edges_by_heuristic(const DistHeapPtr& edges,
                           uint64_t max_size,
                           const FlattenInterfacePtr& flatten,
-                          Allocator* allocator) {
+                          Allocator* allocator,
+                          float cleann_alpha) {
+    if (cleann_alpha >= 1.0F) {
+        std::vector<std::pair<float, uint32_t>> pool;
+        while (!edges->Empty()) {
+            pool.push_back(edges->Top());
+            edges->Pop();
+        }
+        auto selected = cleann_prune::select(
+            std::move(pool), max_size, cleann_alpha,
+            [&](uint32_t a, uint32_t b) { return flatten->ComputePairVectors(a, b); });
+        for (const auto& edge : selected) {
+            edges->Push(edge.first, edge.second);
+        }
+        return;
+    }
     if (edges->Size() < max_size) {
         return;
     }

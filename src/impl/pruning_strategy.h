@@ -28,7 +28,8 @@ void
 select_edges_by_heuristic(const DistHeapPtr& edges,
                           uint64_t max_size,
                           const FlattenInterfacePtr& flatten,
-                          Allocator* allocator);
+                          Allocator* allocator,
+                          float cleann_alpha = 0.0F);
 
 InnerIdType
 mutually_connect_new_element(InnerIdType cur_c,
