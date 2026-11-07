@@ -35,18 +35,9 @@ Here we provide a table of datasets that can be used to test the Merit deletion 
 
 | Dataset         | #Points    | #Dimensions | #Queries |
 |-----------------|------------|-------------|----------|
-| SIFT1M          | 1,000,000  | 128         | 10,000   |
-| GIST1M          | 1,000,000  | 960         | 1,000    |
-| DEEP1M          | 1,000,000  | 96          | 10,000   |
-| DEEP10M         | 10,000,000 | 96          | 10,000   |
+| SIFT100M          | 100,000,000  | 128         | 10,000   |
 | DEEP100M        | 100,000,000| 96          | 10,000   |
-| MSong           | 994,185    | 420         | 1,000    |
-| GloVe           | 1,183,514  | 100         | 10,000   |
-
-- For the SIFT1M and GIST1M datasets, you can download them from the [TEXMEX](http://corpus-texmex.irisa.fr/) website.
-- Thanks to [Yusuke Matsui](https://github.com/matsui528), you can download the DEEP1M, DEEP10M, and DEEP100M datasets from his [repository](https://github.com/matsui528/deep1b_gt).
-- For the MSong dataset, you can download it from the [CUHK-GQR](https://www.cse.cuhk.edu.hk/systems/hash/gqr/datasets.html)
-- Thanks to the authors of [SSG](https://github.com/ZJULearning/SSG), you can download the GloVe datasets from their repository.
+| MSong           | 30,000,000    | 768         | 10,000    |
 
 The example `303_feature_remove` expects `sift_base.fvecs` and `sift_query.fvecs` in the dataset directory. It builds an HGraph with deletion enabled, invokes one scalar Remove and one batched Remove, then verifies that none of the deleted IDs occur in the post-deletion search results.
 
