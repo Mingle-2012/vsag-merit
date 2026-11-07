@@ -14,6 +14,7 @@
 
 #include <vsag/vsag.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -136,21 +137,31 @@ main(int argc, char** argv) {
             throw std::runtime_error("Merit Remove returned failure");
         }
 
-        auto after = index->KnnSearch(query, 10, search_parameters);
-        if (!after.has_value()) {
-            throw std::runtime_error("search after Remove failed: " + after.error().message);
-        }
         std::unordered_set<int64_t> removed(batch_ids.begin(), batch_ids.end());
         removed.insert(scalar_id);
-        for (int64_t i = 0; i < after.value()->GetDim(); ++i) {
-            if (removed.count(after.value()->GetIds()[i]) != 0) {
-                throw std::runtime_error("a removed ID was returned by search");
+        if (index->GetNumElements() != num_vectors - static_cast<int64_t>(removed.size())) {
+            throw std::runtime_error("unexpected live element count after Remove");
+        }
+        const int64_t checked_queries = std::min<int64_t>(num_queries, 100);
+        for (int64_t q = 0; q < checked_queries; ++q) {
+            query->Float32Vectors(queries.data() + q * dim);
+            auto after = index->KnnSearch(query, 10, search_parameters);
+            if (!after.has_value()) {
+                throw std::runtime_error("search after Remove failed: " + after.error().message);
+            }
+            if (after.value()->GetDim() != 10) {
+                throw std::runtime_error("search after Remove did not return 10 neighbors");
+            }
+            for (int64_t i = 0; i < after.value()->GetDim(); ++i) {
+                if (removed.count(after.value()->GetIds()[i]) != 0) {
+                    throw std::runtime_error("a removed ID was returned by search");
+                }
             }
         }
 
         std::cout << "PASS: Merit HGraph Remove on " << num_vectors << " vectors (dim=" << dim
                   << ", 1 scalar + " << batch_ids.size()
-                  << " batched deletions)" << std::endl;
+                  << " batched deletions, " << checked_queries << " queries)" << std::endl;
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << std::endl;
